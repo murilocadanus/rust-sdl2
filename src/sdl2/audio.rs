@@ -7,7 +7,6 @@ use std::c_vec::CVec;
 use libc;
 use libc::{c_int, size_t, c_void};
 use libc::{uint8_t};
-use rustrt::task::Task;
 
 use get_error;
 use rwops::RWops;
@@ -223,6 +222,7 @@ impl AudioSpecWAV {
         let mut audio_len: u32 = 0;
         unsafe {
             let ret = ll::SDL_LoadWAV_RW(src.raw(), 0, &mut desired, &mut audio_buf, &mut audio_len);
+
             if ret.is_null() {
                 Err(get_error())
             } else {
@@ -246,37 +246,7 @@ pub trait AudioCallback<T> {
 
 /// The userdata as seen by the SDL callback.
 struct AudioCallbackUserdata<CB> {
-    task: AudioCallbackTask,
     callback: CB
-}
-
-/// A Task is required to use libstd from SDL's audio callback.
-struct AudioCallbackTask {
-    /// Set to None if there was an error running a previous task.
-    task: Option<Box<Task>>
-}
-
-impl Drop for AudioCallbackTask {
-    /// Destroy the callback task.
-    fn drop(&mut self) {
-        use rustrt::local::Local;
-        use std::mem::replace;
-
-        // Swap out the task with None in order to own it, since drop() only
-        // provides a reference.
-        match replace(&mut self.task, None) {
-            Some(task) => {
-                // pop current task
-                let old_task = Local::take();
-
-                task.destroy();
-
-                // put task back
-                Local::put(old_task);
-            },
-            None => ()
-        };
-    }
 }
 
 /// A phantom type for retreiving the SDL_AudioFormat of a given generic type.
@@ -321,7 +291,7 @@ impl AudioFormatNum<f32> for f32 {
 extern "C" fn audio_callback_marshall<T: AudioFormatNum<T>, CB: AudioCallback<T>>
 (userdata: *const c_void, stream: *const uint8_t, len: c_int) {
     use std::raw::Slice;
-    use std::mem::{replace, size_of, transmute};
+    use std::mem::{size_of, transmute};
     unsafe {
         let mut cb_userdata: &mut AudioCallbackUserdata<CB> = transmute(userdata);
         let buf: &mut [T] = transmute(Slice {
@@ -329,25 +299,7 @@ extern "C" fn audio_callback_marshall<T: AudioFormatNum<T>, CB: AudioCallback<T>
             len: len as uint / size_of::<T>()
         });
 
-        // Perform a dance to move tasks around without compiler errors
-        let new_task = match replace(&mut cb_userdata.task.task, None) {
-            Some(task) => {
-                let n = task.run(|| {
-                    cb_userdata.callback.callback(buf);
-                });
-
-                if n.is_destroyed() { None }
-                else { Some(n) }
-            },
-            None => {
-                // Last callback had an error. Fill buffer with silence.
-                for x in buf.iter_mut() { *x = AudioFormatNum::zero(); }
-
-                None
-            }
-        };
-
-        replace(&mut cb_userdata.task.task, new_task);
+        cb_userdata.callback.callback(buf);
     }
 }
 
@@ -377,11 +329,7 @@ impl<T: AudioFormatNum<T>, CB: AudioCallback<T>> AudioSpecDesired<T, CB> {
     }
 
     fn callback_to_userdata(callback: CB) -> Box<AudioCallbackUserdata<CB>> {
-        let mut task = box Task::new(None, None);
-        task.name = Some("SDL audio callback".into_cow());
-
         box AudioCallbackUserdata {
-            task: AudioCallbackTask { task: Some(task) },
             callback: callback
         }
     }
